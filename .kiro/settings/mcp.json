@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ecommerce": {
+      "command": "/Users/ruitong/vscode/learn-claude-code/mcp-ecommerce-server/.venv/bin/python",
+      "args": ["/Users/ruitong/vscode/learn-claude-code/mcp-ecommerce-server/server.py"]
+    }
+  }
+}
