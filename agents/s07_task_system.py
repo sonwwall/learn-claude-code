@@ -45,26 +45,31 @@ SYSTEM = f"You are a coding agent at {WORKDIR}. Use task tools to plan and track
 
 # -- TaskManager: CRUD with dependency graph, persisted as JSON files --
 class TaskManager:
+    # 负责 .tasks/ 目录下的任务持久化，并维护下一个可用任务 id。
     def __init__(self, tasks_dir: Path):
         self.dir = tasks_dir
         self.dir.mkdir(exist_ok=True)
         self._next_id = self._max_id() + 1
 
     def _max_id(self) -> int:
+        # 扫描现有的 task_N.json 文件，确保程序重启后任务 id 仍然单调递增。
         ids = [int(f.stem.split("_")[1]) for f in self.dir.glob("task_*.json")]
         return max(ids) if ids else 0
 
     def _load(self, task_id: int) -> dict:
+        # 从磁盘读取单个任务文件，并反序列化为 Python 字典。
         path = self.dir / f"task_{task_id}.json"
         if not path.exists():
             raise ValueError(f"Task {task_id} not found")
         return json.loads(path.read_text())
 
     def _save(self, task: dict):
+        # 将单个任务保存回磁盘，使用稳定且便于人工查看的 JSON 格式。
         path = self.dir / f"task_{task['id']}.json"
         path.write_text(json.dumps(task, indent=2, ensure_ascii=False))
 
     def create(self, subject: str, description: str = "") -> str:
+        # 创建一个新的待办任务，初始没有依赖，并以 JSON 文本形式返回。
         task = {
             "id": self._next_id, "subject": subject, "description": description,
             "status": "pending", "blockedBy": [], "owner": "",
@@ -74,10 +79,14 @@ class TaskManager:
         return json.dumps(task, indent=2, ensure_ascii=False)
 
     def get(self, task_id: int) -> str:
+        # 返回单个任务的完整 JSON 内容，供模型或工具继续处理。
         return json.dumps(self._load(task_id), indent=2, ensure_ascii=False)
 
     def update(self, task_id: int, status: str = None,
                add_blocked_by: list = None, remove_blocked_by: list = None) -> str:
+        # 更新单个任务的状态和依赖关系。
+        # 如果任务被标记为 completed，会顺带全局清理依赖它的下游任务，
+        # 这样后续任务会自动解除阻塞，而不需要模型逐个修改文件。
         task = self._load(task_id)
         if status:
             if status not in ("pending", "in_progress", "completed"):
@@ -97,13 +106,17 @@ class TaskManager:
         for f in self.dir.glob("task_*.json"):
             task = json.loads(f.read_text())
             if completed_id in task.get("blockedBy", []):
+                # 这里会直接修改所有依赖该任务的文件。
+                # 这样依赖图的真实状态保存在磁盘里，程序重启或上下文压缩后也不会丢。
                 task["blockedBy"].remove(completed_id)
                 self._save(task)
 
     def list_all(self) -> str:
+        # 返回适合人读的任务摘要，而不是把所有任务都原样输出成 JSON。
         tasks = []
         files = sorted(
             self.dir.glob("task_*.json"),
+            # 这里按数字 id 排序，避免字符串排序时 task_10 排在 task_2 前面。
             key=lambda f: int(f.stem.split("_")[1])
         )
         for f in files:
@@ -123,12 +136,14 @@ TASKS = TaskManager(TASKS_DIR)
 
 # -- Base tool implementations --
 def safe_path(p: str) -> Path:
+    # 将路径解析为工作区内的绝对路径，并阻止通过 ../ 逃逸到工作区之外。
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
 def run_bash(command: str) -> str:
+    # 在工作区内执行 shell 命令，并用简单的危险命令黑名单和超时做保护。
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -141,6 +156,7 @@ def run_bash(command: str) -> str:
         return "Error: Timeout (120s)"
 
 def run_read(path: str, limit: int = None) -> str:
+    # 以文本方式读取文件，并在需要时按行数截断返回内容。
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
@@ -150,6 +166,7 @@ def run_read(path: str, limit: int = None) -> str:
         return f"Error: {e}"
 
 def run_write(path: str, content: str) -> str:
+    # 创建或覆盖文件；如果父目录不存在则一并创建。
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -159,6 +176,7 @@ def run_write(path: str, content: str) -> str:
         return f"Error: {e}"
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
+    # 执行一次精确的文本替换，这种方式简单直接，也更容易保证行为可预测。
     try:
         fp = safe_path(path)
         c = fp.read_text()
@@ -171,6 +189,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 TOOL_HANDLERS = {
+    # 这个映射表负责把模型选择的工具名，转成真正执行的 Python 函数。
     "bash":        lambda **kw: run_bash(kw["command"]),
     "read_file":   lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file":  lambda **kw: run_write(kw["path"], kw["content"]),
@@ -202,6 +221,8 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    # 主循环遵循典型的 ReAct 模式：
+    # 先让模型决定是否要调用工具，再执行工具，然后把结果喂回模型。
     while True:
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
@@ -209,6 +230,7 @@ def agent_loop(messages: list):
         )
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
+            # 如果模型这轮没有继续请求工具，说明当前用户回合已经结束。
             return
         results = []
         for block in response.content:
@@ -220,11 +242,14 @@ def agent_loop(messages: list):
                     output = f"Error: {e}"
                 print(f"> {block.name}:")
                 print(str(output)[:200])
+                # 工具结果会作为一条“伪 user 消息”追加回去，
+                # 因为 Anthropic 的 tool use 协议就是要求模型以这种结构看到结果。
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
         messages.append({"role": "user", "content": results})
 
 
 if __name__ == "__main__":
+    # 这里实现了一个极简交互式命令行：用户每输入一行，就触发一次 agent 回合。
     history = []
     while True:
         try:
