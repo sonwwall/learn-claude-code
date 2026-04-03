@@ -70,11 +70,11 @@ VALID_MSG_TYPES = {
     "plan_approval_response",
 }
 
-# -- Request trackers --
-shutdown_requests = {}
-plan_requests = {}
-_tracker_lock = threading.Lock()
-_claim_lock = threading.Lock()
+# -- 请求跟踪器 --
+shutdown_requests = {}  # 关闭请求跟踪
+plan_requests = {}  # 计划审批请求跟踪
+_tracker_lock = threading.Lock()  # 请求跟踪器的线程锁
+_claim_lock = threading.Lock()  # 任务认领的线程锁，防止多个队友同时认领同一任务
 
 
 # -- MessageBus: JSONL inbox per teammate --
@@ -123,12 +123,18 @@ class MessageBus:
 BUS = MessageBus(INBOX_DIR)
 
 
-# -- Task board scanning --
+# -- 任务板扫描 --
 def scan_unclaimed_tasks() -> list:
+    """扫描任务板，返回所有未认领的任务
+
+    Returns:
+        未认领任务列表（状态为 pending，无 owner，无阻塞）
+    """
     TASKS_DIR.mkdir(exist_ok=True)
     unclaimed = []
     for f in sorted(TASKS_DIR.glob("task_*.json")):
         task = json.loads(f.read_text())
+        # 筛选条件：pending 状态 + 无 owner + 无阻塞
         if (task.get("status") == "pending"
                 and not task.get("owner")
                 and not task.get("blockedBy")):
@@ -137,36 +143,72 @@ def scan_unclaimed_tasks() -> list:
 
 
 def claim_task(task_id: int, owner: str) -> str:
-    with _claim_lock:
+    """认领指定任务（线程安全）
+
+    Args:
+        task_id: 任务 ID
+        owner: 认领者名称
+
+    Returns:
+        认领结果消息
+    """
+    with _claim_lock:  # 加锁防止并发认领
         path = TASKS_DIR / f"task_{task_id}.json"
         if not path.exists():
             return f"Error: Task {task_id} not found"
+
         task = json.loads(path.read_text())
+
+        # 检查任务是否已被认领
         if task.get("owner"):
             existing_owner = task.get("owner") or "someone else"
             return f"Error: Task {task_id} has already been claimed by {existing_owner}"
+
+        # 检查任务状态
         if task.get("status") != "pending":
             status = task.get("status")
             return f"Error: Task {task_id} cannot be claimed because its status is '{status}'"
+
+        # 检查任务是否被阻塞
         if task.get("blockedBy"):
             return f"Error: Task {task_id} is blocked by other task(s) and cannot be claimed yet"
+
+        # 认领任务：设置 owner 和状态
         task["owner"] = owner
         task["status"] = "in_progress"
         path.write_text(json.dumps(task, indent=2))
     return f"Claimed task #{task_id} for {owner}"
 
 
-# -- Identity re-injection after compression --
+def task_label(task: dict) -> str:
+    """返回任务的展示名称，兼容新旧字段名。"""
+    return task.get("subject") or task.get("title") or "(untitled task)"
+
+
+# -- 上下文压缩后的身份重新注入 --
 def make_identity_block(name: str, role: str, team_name: str) -> dict:
+    """创建身份块，用于在上下文压缩后重新注入队友身份
+
+    Args:
+        name: 队友名称
+        role: 队友角色
+        team_name: 团队名称
+
+    Returns:
+        包含身份信息的消息块
+    """
     return {
         "role": "user",
         "content": f"<identity>You are '{name}', role: {role}, team: {team_name}. Continue your work.</identity>",
     }
 
 
-# -- Autonomous TeammateManager --
+# -- 自主队友管理器 --
 class TeammateManager:
+    """自主队友管理器：队友可以自动查找和认领任务"""
+
     def __init__(self, team_dir: Path):
+        """初始化队友管理器"""
         self.dir = team_dir
         self.dir.mkdir(exist_ok=True)
         self.config_path = self.dir / "config.json"
@@ -174,36 +216,54 @@ class TeammateManager:
         self.threads = {}
 
     def _load_config(self) -> dict:
+        """加载团队配置"""
         if self.config_path.exists():
             return json.loads(self.config_path.read_text())
         return {"team_name": "default", "members": []}
 
     def _save_config(self):
+        """保存团队配置"""
         self.config_path.write_text(json.dumps(self.config, indent=2))
 
     def _find_member(self, name: str) -> dict:
+        """查找指定队友"""
         for m in self.config["members"]:
             if m["name"] == name:
                 return m
         return None
 
     def _set_status(self, name: str, status: str):
+        """更新队友状态"""
         member = self._find_member(name)
         if member:
             member["status"] = status
             self._save_config()
 
     def spawn(self, name: str, role: str, prompt: str) -> str:
+        """生成一个自主队友线程
+
+        Args:
+            name: 队友名称
+            role: 队友角色
+            prompt: 初始任务提示
+
+        Returns:
+            生成结果消息
+        """
         member = self._find_member(name)
         if member:
+            # 队友已存在，检查状态
             if member["status"] not in ("idle", "shutdown"):
                 return f"Error: '{name}' is currently {member['status']}"
             member["status"] = "working"
             member["role"] = role
         else:
+            # 创建新队友
             member = {"name": name, "role": role, "status": "working"}
             self.config["members"].append(member)
         self._save_config()
+
+        # 启动自主队友线程
         thread = threading.Thread(
             target=self._loop,
             args=(name, role, prompt),
@@ -214,6 +274,18 @@ class TeammateManager:
         return f"Spawned '{name}' (role: {role})"
 
     def _loop(self, name: str, role: str, prompt: str):
+        """自主队友的主循环：工作阶段 + 空闲轮询阶段
+
+        Args:
+            name: 队友名称
+            role: 队友角色
+            prompt: 初始任务提示
+
+        核心流程：
+        1. 工作阶段：处理任务，调用工具
+        2. 空闲阶段：轮询收件箱和任务板，自动认领新任务
+        3. 超时后自动关闭
+        """
         team_name = self.config["team_name"]
         sys_prompt = (
             f"You are '{name}', role: {role}, team: {team_name}, at {WORKDIR}. "
@@ -223,14 +295,18 @@ class TeammateManager:
         tools = self._teammate_tools()
 
         while True:
-            # -- WORK PHASE: standard agent loop --
+            # -- 工作阶段：标准代理循环 --
             for _ in range(50):
+                # 检查收件箱中的新消息
                 inbox = BUS.read_inbox(name)
                 for msg in inbox:
+                    # 收到关闭请求，立即退出
                     if msg.get("type") == "shutdown_request":
                         self._set_status(name, "shutdown")
                         return
                     messages.append({"role": "user", "content": json.dumps(msg)})
+
+                # 调用 Claude API
                 try:
                     response = client.messages.create(
                         model=MODEL,
@@ -242,14 +318,20 @@ class TeammateManager:
                 except Exception:
                     self._set_status(name, "idle")
                     return
+
                 messages.append({"role": "assistant", "content": response.content})
+
+                # 如果没有工具调用，结束工作阶段
                 if response.stop_reason != "tool_use":
                     break
+
+                # 执行工具调用
                 results = []
-                idle_requested = False
+                idle_requested = False  # 标记是否请求进入空闲状态
                 for block in response.content:
                     if block.type == "tool_use":
                         if block.name == "idle":
+                            # 队友主动请求进入空闲状态
                             idle_requested = True
                             output = "Entering idle phase. Will poll for new tasks."
                         else:
@@ -261,49 +343,76 @@ class TeammateManager:
                             "content": str(output),
                         })
                 messages.append({"role": "user", "content": results})
+
+                # 如果请求空闲，退出工作循环
                 if idle_requested:
                     break
 
-            # -- IDLE PHASE: poll for inbox messages and unclaimed tasks --
+            # -- 空闲阶段：轮询收件箱和未认领任务 --
             self._set_status(name, "idle")
-            resume = False
-            polls = IDLE_TIMEOUT // max(POLL_INTERVAL, 1)
+            resume = False  # 标记是否恢复工作
+            polls = IDLE_TIMEOUT // max(POLL_INTERVAL, 1)  # 计算轮询次数
+
             for _ in range(polls):
-                time.sleep(POLL_INTERVAL)
+                time.sleep(POLL_INTERVAL)  # 等待 5 秒
+
+                # 检查收件箱是否有新消息
                 inbox = BUS.read_inbox(name)
                 if inbox:
                     for msg in inbox:
+                        # 收到关闭请求，立即退出
                         if msg.get("type") == "shutdown_request":
                             self._set_status(name, "shutdown")
                             return
                         messages.append({"role": "user", "content": json.dumps(msg)})
-                    resume = True
+                    resume = True  # 有新消息，恢复工作
                     break
+
+                # 扫描任务板，查找未认领的任务
                 unclaimed = scan_unclaimed_tasks()
                 if unclaimed:
-                    task = unclaimed[0]
+                    task = unclaimed[0]  # 取第一个未认领任务
                     result = claim_task(task["id"], name)
                     if result.startswith("Error:"):
-                        continue
+                        continue  # 认领失败，继续轮询
+
+                    # 认领成功，构建任务提示
                     task_prompt = (
-                        f"<auto-claimed>Task #{task['id']}: {task['subject']}\n"
+                        f"<auto-claimed>Task #{task['id']}: {task_label(task)}\n"
                         f"{task.get('description', '')}</auto-claimed>"
                     )
+
+                    # 如果消息历史太短，重新注入身份信息
                     if len(messages) <= 3:
                         messages.insert(0, make_identity_block(name, role, team_name))
                         messages.insert(1, {"role": "assistant", "content": f"I am {name}. Continuing."})
+
+                    # 添加任务到消息历史
                     messages.append({"role": "user", "content": task_prompt})
                     messages.append({"role": "assistant", "content": f"Claimed task #{task['id']}. Working on it."})
-                    resume = True
+                    resume = True  # 认领成功，恢复工作
                     break
 
+            # 超时未找到新工作，关闭线程
             if not resume:
                 self._set_status(name, "shutdown")
                 return
+
+            # 恢复工作状态
             self._set_status(name, "working")
 
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
-        # these base tools are unchanged from s02
+        """执行队友的工具调用
+
+        Args:
+            sender: 调用者名称
+            tool_name: 工具名称
+            args: 工具参数
+
+        Returns:
+            工具执行结果
+        """
+        # 基础工具（从 s02 继承）
         if tool_name == "bash":
             return _run_bash(args["command"])
         if tool_name == "read_file":
@@ -316,6 +425,8 @@ class TeammateManager:
             return BUS.send(sender, args["to"], args["content"], args.get("msg_type", "message"))
         if tool_name == "read_inbox":
             return json.dumps(BUS.read_inbox(sender), indent=2)
+
+        # 关闭响应协议
         if tool_name == "shutdown_response":
             req_id = args["request_id"]
             with _tracker_lock:
@@ -326,6 +437,8 @@ class TeammateManager:
                 "shutdown_response", {"request_id": req_id, "approve": args["approve"]},
             )
             return f"Shutdown {'approved' if args['approve'] else 'rejected'}"
+
+        # 计划审批协议
         if tool_name == "plan_approval":
             plan_text = args.get("plan", "")
             req_id = str(uuid.uuid4())[:8]
@@ -336,8 +449,11 @@ class TeammateManager:
                 {"request_id": req_id, "plan": plan_text},
             )
             return f"Plan submitted (request_id={req_id}). Waiting for approval."
+
+        # 任务认领（新增）
         if tool_name == "claim_task":
             return claim_task(args["task_id"], sender)
+
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
@@ -366,6 +482,7 @@ class TeammateManager:
         ]
 
     def list_all(self) -> str:
+        """列出所有队友及其状态"""
         if not self.config["members"]:
             return "No teammates."
         lines = [f"Team: {self.config['team_name']}"]
@@ -374,6 +491,7 @@ class TeammateManager:
         return "\n".join(lines)
 
     def member_names(self) -> list:
+        """返回所有队友的名称列表"""
         return [m["name"] for m in self.config["members"]]
 
 
@@ -435,8 +553,16 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
-# -- Lead-specific protocol handlers --
+# -- Lead 专用协议处理器 --
 def handle_shutdown_request(teammate: str) -> str:
+    """Lead 发起关闭请求给指定队友
+
+    Args:
+        teammate: 目标队友名称
+
+    Returns:
+        请求结果，包含 request_id
+    """
     req_id = str(uuid.uuid4())[:8]
     with _tracker_lock:
         shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
@@ -448,6 +574,16 @@ def handle_shutdown_request(teammate: str) -> str:
 
 
 def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
+    """Lead 审批队友提交的计划
+
+    Args:
+        request_id: 计划请求 ID
+        approve: 是否批准
+        feedback: 反馈意见
+
+    Returns:
+        审批结果
+    """
     with _tracker_lock:
         req = plan_requests.get(request_id)
     if not req:
@@ -462,11 +598,12 @@ def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> st
 
 
 def _check_shutdown_status(request_id: str) -> str:
+    """检查关闭请求的状态"""
     with _tracker_lock:
         return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
 
 
-# -- Lead tool dispatch (14 tools) --
+# -- Lead 工具分发器（14 个工具）--
 TOOL_HANDLERS = {
     "bash":              lambda **kw: _run_bash(kw["command"]),
     "read_file":         lambda **kw: _run_read(kw["path"], kw.get("limit")),
@@ -480,8 +617,8 @@ TOOL_HANDLERS = {
     "shutdown_request":  lambda **kw: handle_shutdown_request(kw["teammate"]),
     "shutdown_response": lambda **kw: _check_shutdown_status(kw.get("request_id", "")),
     "plan_approval":     lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),
-    "idle":              lambda **kw: "Lead does not idle.",
-    "claim_task":        lambda **kw: claim_task(kw["task_id"], "lead"),
+    "idle":              lambda **kw: "Lead does not idle.",  # Lead 不进入空闲状态
+    "claim_task":        lambda **kw: claim_task(kw["task_id"], "lead"),  # Lead 也可以认领任务
 }
 
 # these base tools are unchanged from s02
@@ -518,13 +655,21 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    """Lead 的主循环：处理用户请求、管理自主队友
+
+    Args:
+        messages: 对话历史
+    """
     while True:
+        # 检查收件箱中的新消息（来自队友的响应）
         inbox = BUS.read_inbox("lead")
         if inbox:
             messages.append({
                 "role": "user",
                 "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>",
             })
+
+        # 调用 Claude API
         response = client.messages.create(
             model=MODEL,
             system=SYSTEM,
@@ -533,8 +678,12 @@ def agent_loop(messages: list):
             max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
+
+        # 如果没有工具调用，结束循环
         if response.stop_reason != "tool_use":
             return
+
+        # 执行工具调用
         results = []
         for block in response.content:
             if block.type == "tool_use":
@@ -554,30 +703,44 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
+    """主程序：交互式命令行界面，支持自主队友管理"""
     history = []
     while True:
         try:
             query = input("\033[36ms11 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
+
+        # 退出命令
         if query.strip().lower() in ("q", "exit", ""):
             break
+
+        # 特殊命令：查看团队状态
         if query.strip() == "/team":
             print(TEAM.list_all())
             continue
+
+        # 特殊命令：查看收件箱
         if query.strip() == "/inbox":
             print(json.dumps(BUS.read_inbox("lead"), indent=2))
             continue
+
+        # 特殊命令：查看任务板
         if query.strip() == "/tasks":
             TASKS_DIR.mkdir(exist_ok=True)
             for f in sorted(TASKS_DIR.glob("task_*.json")):
                 t = json.loads(f.read_text())
+                # 任务状态标记：[ ] pending, [>] in_progress, [x] completed
                 marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(t["status"], "[?]")
                 owner = f" @{t['owner']}" if t.get("owner") else ""
-                print(f"  {marker} #{t['id']}: {t['subject']}{owner}")
+                print(f"  {marker} #{t['id']}: {task_label(t)}{owner}")
             continue
+
+        # 处理用户查询
         history.append({"role": "user", "content": query})
         agent_loop(history)
+
+        # 显示 AI 响应
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:
