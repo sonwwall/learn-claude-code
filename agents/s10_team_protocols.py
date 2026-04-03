@@ -78,22 +78,39 @@ VALID_MSG_TYPES = {
     "plan_approval_response",
 }
 
-# -- Request trackers: correlate by request_id --
+# -- 请求跟踪器：通过 request_id 关联请求和响应 --
+# shutdown_requests: 存储关闭请求的状态 {request_id: {"target": name, "status": "pending|approved|rejected"}}
+# plan_requests: 存储计划审批请求的状态 {request_id: {"from": name, "plan": text, "status": "pending|approved|rejected"}}
 shutdown_requests = {}
 plan_requests = {}
-_tracker_lock = threading.Lock()
+_tracker_lock = threading.Lock()  # 线程锁，保护共享状态
 
 
-# -- MessageBus: JSONL inbox per teammate --
+# -- MessageBus: 每个队友一个 JSONL 收件箱 --
 class MessageBus:
+    """消息总线：管理团队成员之间的消息传递"""
+
     def __init__(self, inbox_dir: Path):
+        """初始化消息总线，创建收件箱目录"""
         self.dir = inbox_dir
         self.dir.mkdir(parents=True, exist_ok=True)
 
     def send(self, sender: str, to: str, content: str,
              msg_type: str = "message", extra: dict = None) -> str:
+        """发送消息到指定队友的收件箱
+
+        Args:
+            sender: 发送者名称
+            to: 接收者名称
+            content: 消息内容
+            msg_type: 消息类型（message/broadcast/shutdown_request等）
+            extra: 额外的消息字段（如 request_id）
+        """
+        # 验证消息类型
         if msg_type not in VALID_MSG_TYPES:
             return f"Error: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
+
+        # 构建消息对象
         msg = {
             "type": msg_type,
             "from": sender,
@@ -101,27 +118,48 @@ class MessageBus:
             "timestamp": time.time(),
         }
         if extra:
-            msg.update(extra)
+            msg.update(extra)  # 添加额外字段（如 request_id）
+
+        # 追加到接收者的 JSONL 收件箱
         inbox_path = self.dir / f"{to}.jsonl"
         with open(inbox_path, "a") as f:
             f.write(json.dumps(msg) + "\n")
         return f"Sent {msg_type} to {to}"
 
     def read_inbox(self, name: str) -> list:
+        """读取并清空指定队友的收件箱
+
+        Args:
+            name: 队友名称
+
+        Returns:
+            消息列表，读取后收件箱会被清空
+        """
         inbox_path = self.dir / f"{name}.jsonl"
         if not inbox_path.exists():
             return []
+
+        # 读取所有消息
         messages = []
         for line in inbox_path.read_text().strip().splitlines():
             if line:
                 messages.append(json.loads(line))
+
+        # 清空收件箱（已读即删除）
         inbox_path.write_text("")
         return messages
 
     def broadcast(self, sender: str, content: str, teammates: list) -> str:
+        """广播消息给所有队友（除了发送者自己）
+
+        Args:
+            sender: 发送者名称
+            content: 广播内容
+            teammates: 所有队友名称列表
+        """
         count = 0
         for name in teammates:
-            if name != sender:
+            if name != sender:  # 不发给自己
                 self.send(sender, name, content, "broadcast")
                 count += 1
         return f"Broadcast to {count} teammates"
@@ -130,40 +168,60 @@ class MessageBus:
 BUS = MessageBus(INBOX_DIR)
 
 
-# -- TeammateManager with shutdown + plan approval --
+# -- TeammateManager 带关闭和计划审批功能 --
 class TeammateManager:
+    """队友管理器：负责生成、管理队友线程，处理关闭和计划审批协议"""
+
     def __init__(self, team_dir: Path):
+        """初始化队友管理器"""
         self.dir = team_dir
         self.dir.mkdir(exist_ok=True)
         self.config_path = self.dir / "config.json"
         self.config = self._load_config()
-        self.threads = {}
+        self.threads = {}  # 存储活跃的线程对象
 
     def _load_config(self) -> dict:
+        """加载团队配置文件"""
         if self.config_path.exists():
             return json.loads(self.config_path.read_text())
         return {"team_name": "default", "members": []}
 
     def _save_config(self):
+        """保存团队配置到文件"""
         self.config_path.write_text(json.dumps(self.config, indent=2))
 
     def _find_member(self, name: str) -> dict:
+        """查找指定名称的队友"""
         for m in self.config["members"]:
             if m["name"] == name:
                 return m
         return None
 
     def spawn(self, name: str, role: str, prompt: str) -> str:
+        """生成一个新的队友线程
+
+        Args:
+            name: 队友名称
+            role: 队友角色
+            prompt: 初始任务提示
+
+        Returns:
+            生成结果消息
+        """
         member = self._find_member(name)
         if member:
+            # 队友已存在，检查状态
             if member["status"] not in ("idle", "shutdown"):
                 return f"Error: '{name}' is currently {member['status']}"
             member["status"] = "working"
             member["role"] = role
         else:
+            # 创建新队友
             member = {"name": name, "role": role, "status": "working"}
             self.config["members"].append(member)
         self._save_config()
+
+        # 启动队友线程
         thread = threading.Thread(
             target=self._teammate_loop,
             args=(name, role, prompt),
@@ -174,6 +232,14 @@ class TeammateManager:
         return f"Spawned '{name}' (role: {role})"
 
     def _teammate_loop(self, name: str, role: str, prompt: str):
+        """队友的主循环：处理任务、接收消息、响应协议
+
+        Args:
+            name: 队友名称
+            role: 队友角色
+            prompt: 初始任务提示
+        """
+        # 构建系统提示
         sys_prompt = (
             f"You are '{name}', role: {role}, at {WORKDIR}. "
             f"Submit plans via plan_approval before major work. "
@@ -181,13 +247,20 @@ class TeammateManager:
         )
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()
-        should_exit = False
+        should_exit = False  # 关闭标志
+
+        # 主循环：最多 50 轮
         for _ in range(50):
+            # 读取收件箱中的新消息
             inbox = BUS.read_inbox(name)
             for msg in inbox:
                 messages.append({"role": "user", "content": json.dumps(msg)})
+
+            # 检查是否需要退出
             if should_exit:
                 break
+
+            # 调用 Claude API
             try:
                 response = client.messages.create(
                     model=MODEL,
@@ -198,9 +271,14 @@ class TeammateManager:
                 )
             except Exception:
                 break
+
             messages.append({"role": "assistant", "content": response.content})
+
+            # 如果没有工具调用，结束循环
             if response.stop_reason != "tool_use":
                 break
+
+            # 执行工具调用
             results = []
             for block in response.content:
                 if block.type == "tool_use":
@@ -211,16 +289,29 @@ class TeammateManager:
                         "tool_use_id": block.id,
                         "content": str(output),
                     })
+                    # 如果批准了关闭请求，设置退出标志
                     if block.name == "shutdown_response" and block.input.get("approve"):
                         should_exit = True
             messages.append({"role": "user", "content": results})
+
+        # 更新队友状态
         member = self._find_member(name)
         if member:
             member["status"] = "shutdown" if should_exit else "idle"
             self._save_config()
 
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
-        # these base tools are unchanged from s02
+        """执行队友的工具调用
+
+        Args:
+            sender: 调用者名称
+            tool_name: 工具名称
+            args: 工具参数
+
+        Returns:
+            工具执行结果
+        """
+        # 基础工具（从 s02 继承，未改变）
         if tool_name == "bash":
             return _run_bash(args["command"])
         if tool_name == "read_file":
@@ -233,27 +324,36 @@ class TeammateManager:
             return BUS.send(sender, args["to"], args["content"], args.get("msg_type", "message"))
         if tool_name == "read_inbox":
             return json.dumps(BUS.read_inbox(sender), indent=2)
+
+        # 关闭响应协议
         if tool_name == "shutdown_response":
             req_id = args["request_id"]
             approve = args["approve"]
+            # 更新请求状态
             with _tracker_lock:
                 if req_id in shutdown_requests:
                     shutdown_requests[req_id]["status"] = "approved" if approve else "rejected"
+            # 发送响应给 lead
             BUS.send(
                 sender, "lead", args.get("reason", ""),
                 "shutdown_response", {"request_id": req_id, "approve": approve},
             )
             return f"Shutdown {'approved' if approve else 'rejected'}"
+
+        # 计划审批协议
         if tool_name == "plan_approval":
             plan_text = args.get("plan", "")
-            req_id = str(uuid.uuid4())[:8]
+            req_id = str(uuid.uuid4())[:8]  # 生成请求 ID
+            # 记录计划请求
             with _tracker_lock:
                 plan_requests[req_id] = {"from": sender, "plan": plan_text, "status": "pending"}
+            # 发送计划给 lead 审批
             BUS.send(
                 sender, "lead", plan_text, "plan_approval_response",
                 {"request_id": req_id, "plan": plan_text},
             )
             return f"Plan submitted (request_id={req_id}). Waiting for lead approval."
+
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
@@ -278,6 +378,7 @@ class TeammateManager:
         ]
 
     def list_all(self) -> str:
+        """列出所有队友及其状态"""
         if not self.config["members"]:
             return "No teammates."
         lines = [f"Team: {self.config['team_name']}"]
@@ -286,14 +387,16 @@ class TeammateManager:
         return "\n".join(lines)
 
     def member_names(self) -> list:
+        """返回所有队友的名称列表"""
         return [m["name"] for m in self.config["members"]]
 
 
 TEAM = TeammateManager(TEAM_DIR)
 
 
-# -- Base tool implementations (these base tools are unchanged from s02) --
+# -- 基础工具实现（这些基础工具从 s02 继承，未改变）--
 def _safe_path(p: str) -> Path:
+    """验证路径安全性，防止路径逃逸"""
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
@@ -301,6 +404,8 @@ def _safe_path(p: str) -> Path:
 
 
 def _run_bash(command: str) -> str:
+    """执行 bash 命令"""
+    # 阻止危险命令
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -316,6 +421,7 @@ def _run_bash(command: str) -> str:
 
 
 def _run_read(path: str, limit: int = None) -> str:
+    """读取文件内容"""
     try:
         lines = _safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
@@ -326,6 +432,7 @@ def _run_read(path: str, limit: int = None) -> str:
 
 
 def _run_write(path: str, content: str) -> str:
+    """写入文件内容"""
     try:
         fp = _safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -336,6 +443,7 @@ def _run_write(path: str, content: str) -> str:
 
 
 def _run_edit(path: str, old_text: str, new_text: str) -> str:
+    """编辑文件：替换指定文本"""
     try:
         fp = _safe_path(path)
         c = fp.read_text()
@@ -347,11 +455,21 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
-# -- Lead-specific protocol handlers --
+# -- Lead 专用协议处理器 --
 def handle_shutdown_request(teammate: str) -> str:
-    req_id = str(uuid.uuid4())[:8]
+    """Lead 发起关闭请求给指定队友
+
+    Args:
+        teammate: 目标队友名称
+
+    Returns:
+        请求结果，包含 request_id
+    """
+    req_id = str(uuid.uuid4())[:8]  # 生成唯一请求 ID
+    # 记录请求状态
     with _tracker_lock:
         shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
+    # 发送关闭请求消息
     BUS.send(
         "lead", teammate, "Please shut down gracefully.",
         "shutdown_request", {"request_id": req_id},
@@ -360,12 +478,24 @@ def handle_shutdown_request(teammate: str) -> str:
 
 
 def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
+    """Lead 审批队友提交的计划
+
+    Args:
+        request_id: 计划请求 ID
+        approve: 是否批准
+        feedback: 反馈意见
+
+    Returns:
+        审批结果
+    """
     with _tracker_lock:
         req = plan_requests.get(request_id)
     if not req:
         return f"Error: Unknown plan request_id '{request_id}'"
+    # 更新请求状态
     with _tracker_lock:
         req["status"] = "approved" if approve else "rejected"
+    # 发送审批结果给队友
     BUS.send(
         "lead", req["from"], feedback, "plan_approval_response",
         {"request_id": request_id, "approve": approve, "feedback": feedback},
@@ -374,11 +504,12 @@ def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> st
 
 
 def _check_shutdown_status(request_id: str) -> str:
+    """检查关闭请求的状态"""
     with _tracker_lock:
         return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
 
 
-# -- Lead tool dispatch (12 tools) --
+# -- Lead 工具分发器（12 个工具）--
 TOOL_HANDLERS = {
     "bash":              lambda **kw: _run_bash(kw["command"]),
     "read_file":         lambda **kw: _run_read(kw["path"], kw.get("limit")),
@@ -389,9 +520,9 @@ TOOL_HANDLERS = {
     "send_message":      lambda **kw: BUS.send("lead", kw["to"], kw["content"], kw.get("msg_type", "message")),
     "read_inbox":        lambda **kw: json.dumps(BUS.read_inbox("lead"), indent=2),
     "broadcast":         lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
-    "shutdown_request":  lambda **kw: handle_shutdown_request(kw["teammate"]),
-    "shutdown_response": lambda **kw: _check_shutdown_status(kw.get("request_id", "")),
-    "plan_approval":     lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),
+    "shutdown_request":  lambda **kw: handle_shutdown_request(kw["teammate"]),  # 发起关闭请求
+    "shutdown_response": lambda **kw: _check_shutdown_status(kw.get("request_id", "")),  # 检查关闭状态
+    "plan_approval":     lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),  # 审批计划
 }
 
 # these base tools are unchanged from s02
@@ -424,13 +555,21 @@ TOOLS = [
 
 
 def agent_loop(messages: list):
+    """Lead 的主循环：处理用户请求、管理队友、处理协议
+
+    Args:
+        messages: 对话历史
+    """
     while True:
+        # 检查收件箱中的新消息（来自队友的响应）
         inbox = BUS.read_inbox("lead")
         if inbox:
             messages.append({
                 "role": "user",
                 "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>",
             })
+
+        # 调用 Claude API
         response = client.messages.create(
             model=MODEL,
             system=SYSTEM,
@@ -439,8 +578,12 @@ def agent_loop(messages: list):
             max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
+
+        # 如果没有工具调用，结束循环
         if response.stop_reason != "tool_use":
             return
+
+        # 执行工具调用
         results = []
         for block in response.content:
             if block.type == "tool_use":
@@ -460,22 +603,33 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
+    """主程序：交互式命令行界面"""
     history = []
     while True:
         try:
             query = input("\033[36ms10 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
+
+        # 退出命令
         if query.strip().lower() in ("q", "exit", ""):
             break
+
+        # 特殊命令：查看团队状态
         if query.strip() == "/team":
             print(TEAM.list_all())
             continue
+
+        # 特殊命令：查看收件箱
         if query.strip() == "/inbox":
             print(json.dumps(BUS.read_inbox("lead"), indent=2))
             continue
+
+        # 处理用户查询
         history.append({"role": "user", "content": query})
         agent_loop(history)
+
+        # 显示 AI 响应
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:
