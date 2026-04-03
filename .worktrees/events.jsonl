@@ -1,0 +1,7 @@
+{"event": "worktree.create.before", "ts": 1775186915.279326, "task": {"id": 1}, "worktree": {"name": "auth-refactor", "base_ref": "HEAD"}}
+{"event": "worktree.create.failed", "ts": 1775186915.303467, "task": {"id": 1}, "worktree": {"name": "auth-refactor", "base_ref": "HEAD"}, "error": "Preparing worktree (new branch 'wt/auth-refactor')\nfatal: a branch named 'wt/auth-refactor' already exists"}
+{"event": "worktree.create.before", "ts": 1775186933.1716359, "task": {"id": 1}, "worktree": {"name": "auth-refactor-v2", "base_ref": "HEAD"}}
+{"event": "worktree.create.after", "ts": 1775186933.2670999, "task": {"id": 1}, "worktree": {"name": "auth-refactor-v2", "path": "/Users/ruitong/vscode/learn-claude-code/.worktrees/auth-refactor-v2", "branch": "wt/auth-refactor-v2", "status": "active"}}
+{"event": "worktree.create.before", "ts": 1775186956.0474188, "task": {"id": 2}, "worktree": {"name": "ui-login", "base_ref": "HEAD"}}
+{"event": "worktree.create.after", "ts": 1775186956.1253161, "task": {"id": 2}, "worktree": {"name": "ui-login", "path": "/Users/ruitong/vscode/learn-claude-code/.worktrees/ui-login", "branch": "wt/ui-login", "status": "active"}}
+{"event": "worktree.keep", "ts": 1775187073.506058, "task": {"id": 2}, "worktree": {"name": "ui-login", "path": "/Users/ruitong/vscode/learn-claude-code/.worktrees/ui-login", "status": "kept"}}

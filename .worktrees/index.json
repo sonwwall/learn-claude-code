@@ -1,0 +1,21 @@
+{
+  "worktrees": [
+    {
+      "name": "auth-refactor-v2",
+      "path": "/Users/ruitong/vscode/learn-claude-code/.worktrees/auth-refactor-v2",
+      "branch": "wt/auth-refactor-v2",
+      "task_id": 1,
+      "status": "active",
+      "created_at": 1775186933.266026
+    },
+    {
+      "name": "ui-login",
+      "path": "/Users/ruitong/vscode/learn-claude-code/.worktrees/ui-login",
+      "branch": "wt/ui-login",
+      "task_id": 2,
+      "status": "kept",
+      "created_at": 1775186956.124446,
+      "kept_at": 1775187073.5054321
+    }
+  ]
+}
